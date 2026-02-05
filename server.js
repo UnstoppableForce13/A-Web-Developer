@@ -1,190 +1,168 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Custom Website Platform</title>
-<style>
-body{font-family:sans-serif;margin:20px;}
-.hidden{display:none;}
-.box{border:1px solid #ccc;padding:10px;margin:10px 0;}
-button{margin:2px;}
-textarea{width:100%;height:50px;}
-</style>
-</head>
-<body>
+// server.js
+const express = require('express');
+const http = require('http');
+const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const sqlite3 = require('sqlite3').verbose();
+const { Server } = require('socket.io');
 
-<h1>Custom Website Platform</h1>
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
-<div id="loginBox">
-<h2>Login / Register</h2>
-<input id="name" placeholder="Name"/><br/>
-<input id="email" placeholder="Email"/><br/>
-<input id="password" type="password" placeholder="Password"/><br/>
-<button onclick="register()">Register</button>
-<button onclick="login()">Login</button>
-</div>
+app.use(cors());
+app.use(express.json());
 
-<div id="dashboard" class="hidden">
-<h2>Dashboard</h2>
-<p>Logged in as <span id="role"></span>: <b id="userName"></b></p>
-<button onclick="logout()">Logout</button>
+const SECRET = "SUPER_SECRET_KEY";
 
-<div id="createRequest" class="hidden">
-<h3>Create Request</h3>
-<input id="reqTitle" placeholder="Title"/><br/>
-<textarea id="reqDesc" placeholder="Description"></textarea><br/>
-<button onclick="createRequest()">Add Request</button>
-</div>
+// ----- DATABASE -----
+const db = new sqlite3.Database('./platform.db');
 
-<div id="requestsList">
-<h3>Requests</h3>
-<div id="requests"></div>
-</div>
+// Create tables
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    email TEXT UNIQUE,
+    password TEXT,
+    role TEXT DEFAULT 'user'
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER,
+    title TEXT,
+    description TEXT,
+    price REAL,
+    delivery_time TEXT,
+    status TEXT DEFAULT 'pending',
+    FOREIGN KEY(owner_id) REFERENCES users(id)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER,
+    sender TEXT,
+    content TEXT,
+    FOREIGN KEY(request_id) REFERENCES requests(id)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER,
+    amount REAL,
+    method TEXT,
+    status TEXT DEFAULT 'pending'
+  )`);
+});
 
-<div id="chatBox" class="hidden">
-<h3>Chat for Request <span id="chatRequestId"></span></h3>
-<div id="messages" style="border:1px solid #ccc;height:200px;overflow:auto;padding:5px;"></div>
-<input id="chatInput" placeholder="Type message"/><button onclick="sendMessage()">Send</button>
-</div>
-
-</div>
-
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-<script>
-let token='';
-let role='';
-let userName='';
-let requests=[];
-let currentChatId=null;
-const socket = io('http://localhost:5000');
-
-// ----- AUTH -----
-function register(){
-  fetch('http://localhost:5000/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('name').value,email:document.getElementById('email').value,password:document.getElementById('password').value})})
-  .then(r=>r.json()).then(console.log).catch(console.error);
+// ----- AUTH MIDDLEWARE -----
+function auth(req,res,next){
+  const token = req.headers.authorization?.split(' ')[1];
+  if(!token) return res.status(401).json({message:'No token'});
+  try{
+    const decoded = jwt.verify(token, SECRET);
+    req.user = decoded;
+    next();
+  }catch(e){ res.status(403).json({message:'Invalid token'}); }
 }
-function login(){
-  fetch('http://localhost:5000/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('email').value,password:document.getElementById('password').value})})
-  .then(r=>r.json()).then(res=>{
-    token=res.token; role=res.role; userName=res.name;
-    document.getElementById('role').innerText=role;
-    document.getElementById('userName').innerText=userName;
-    document.getElementById('loginBox').classList.add('hidden');
-    document.getElementById('dashboard').classList.remove('hidden');
-    if(role!=='admin') document.getElementById('createRequest').classList.remove('hidden');
-    loadRequests();
-  }).catch(console.error);
+
+// ----- ROLE CHECK -----
+function permit(...roles){
+  return (req,res,next)=>{
+    if(!roles.includes(req.user.role)) return res.status(403).json({message:'Forbidden'});
+    next();
+  }
 }
-function logout(){
-  token=''; role=''; userName='';
-  document.getElementById('dashboard').classList.add('hidden');
-  document.getElementById('loginBox').classList.remove('hidden');
-}
+
+// ----- AUTH ROUTES -----
+app.post('/api/register', async (req,res)=>{
+  const {name,email,password} = req.body;
+  const hashed = await bcrypt.hash(password,10);
+  db.run(`INSERT INTO users (name,email,password) VALUES (?,?,?)`,
+    [name,email,hashed],
+    function(err){
+      if(err) return res.status(400).json({error: err.message});
+      res.json({id:this.lastID,name,email,role:'user'});
+    }
+  );
+});
+
+app.post('/api/login', (req,res)=>{
+  const {email,password} = req.body;
+  db.get(`SELECT * FROM users WHERE email=?`, [email], async (err,user)=>{
+    if(err) return res.status(500).json({error:err.message});
+    if(!user) return res.status(400).json({message:'User not found'});
+    const valid = await bcrypt.compare(password,user.password);
+    if(!valid) return res.status(400).json({message:'Invalid password'});
+    const token = jwt.sign({id:user.id,role:user.role,name:user.name},SECRET,{expiresIn:'7d'});
+    res.json({token,role:user.role,name:user.name});
+  });
+});
 
 // ----- REQUESTS -----
-function createRequest(){
-  const title=document.getElementById('reqTitle').value;
-  const desc=document.getElementById('reqDesc').value;
-  fetch('http://localhost:5000/api/requests',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({title,description:desc})})
-  .then(r=>r.json()).then(()=>{loadRequests();}).catch(console.error);
-}
+app.post('/api/requests', auth, (req,res)=>{
+  const {title,description} = req.body;
+  db.run(`INSERT INTO requests (owner_id,title,description) VALUES (?,?,?)`,
+    [req.user.id,title,description],
+    function(err){
+      if(err) return res.status(500).json({error:err.message});
+      res.json({id:this.lastID,title,description,status:'pending'});
+    }
+  );
+});
 
-function loadRequests(){
-  fetch('http://localhost:5000/api/requests',{headers:{'Authorization':'Bearer '+token}})
-  .then(r=>r.json()).then(data=>{
-    requests=data;
-    const div=document.getElementById('requests'); div.innerHTML='';
-    requests.forEach(r=>{
-      const box=document.createElement('div'); box.className='box';
-      box.innerHTML=`<b>${r.title}</b><br/>${r.description}<br/>Status:${r.status} Price:${r.price||'-'} Delivery:${r.delivery_time||'-'}<br/>`;
-
-      // Editable by owner or admin
-      if(r.owner_id==userName || role==='admin'){
-        box.innerHTML+=`<button onclick="editRequest(${r.id})">Edit</button> <button onclick="deleteRequest(${r.id})">Delete</button> `;
-      }
-
-      // Admin sets price/delivery if status pending
-      if(role==='admin' && r.status==='pending'){
-        box.innerHTML+=`<button onclick="setPriceDelivery(${r.id})">Set Price/Delivery</button>`;
-      }
-
-      // User accepts trade
-      if(role!=='admin' && r.status==='price_set'){
-        box.innerHTML+=`<button onclick="acceptTrade(${r.id})">Accept Trade</button>`;
-      }
-
-      // Admin confirms payment
-      if(role==='admin' && r.status==='user_accepted'){
-        box.innerHTML+=`<button onclick="confirmPayment(${r.id})">Confirm Payment</button>`;
-      }
-
-      // Chat button
-      box.innerHTML+=`<button onclick="openChat(${r.id})">Chat</button>`;
-
-      div.appendChild(box);
-    });
-  });
-}
-
-function editRequest(id){
-  const newTitle=prompt('New title:');
-  const newDesc=prompt('New description:');
-  fetch('http://localhost:5000/api/requests/'+id,{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({title:newTitle,description:newDesc})})
-  .then(r=>r.json()).then(()=>loadRequests());
-}
-
-function deleteRequest(id){
-  fetch('http://localhost:5000/api/requests/'+id,{method:'DELETE',headers:{'Authorization':'Bearer '+token}})
-  .then(r=>r.json()).then(()=>loadRequests());
-}
-
-// ----- NEGOTIATION -----
-function setPriceDelivery(id){
-  const price=prompt('Set Price:');
-  const delivery=prompt('Set Delivery Time:');
-  fetch('http://localhost:5000/api/requests/'+id,{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({price,delivery_time:delivery,status:'price_set'})})
-  .then(r=>r.json()).then(()=>loadRequests());
-}
-
-function acceptTrade(id){
-  fetch('http://localhost:5000/api/requests/'+id,{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({status:'user_accepted'})})
-  .then(r=>r.json()).then(()=>loadRequests());
-}
-
-function confirmPayment(id){
-  fetch('http://localhost:5000/api/requests/'+id,{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({status:'paid'})})
-  .then(r=>r.json()).then(()=>loadRequests());
-}
-
-// ----- CHAT -----
-function openChat(id){
-  currentChatId=id;
-  document.getElementById('chatBox').classList.remove('hidden');
-  document.getElementById('chatRequestId').innerText=id;
-  socket.emit('join',id);
-  loadMessages();
-}
-
-function loadMessages(){
-  fetch('http://localhost:5000/api/messages/'+currentChatId,{headers:{'Authorization':'Bearer '+token}})
-  .then(r=>r.json()).then(data=>{
-    const div=document.getElementById('messages'); div.innerHTML='';
-    data.forEach(m=>{div.innerHTML+=`<b>${m.sender}:</b> ${m.content}<br/>`;});
-  });
-}
-
-function sendMessage(){
-  const msg=document.getElementById('chatInput').value;
-  socket.emit('send',{room:currentChatId,sender:userName,content:msg});
-  document.getElementById('chatInput').value='';
-}
-
-socket.on('receive',({sender,content})=>{
-  if(currentChatId){
-    const div=document.getElementById('messages');
-    div.innerHTML+=`<b>${sender}:</b> ${content}<br/>`;
+app.get('/api/requests', auth, (req,res)=>{
+  if(req.user.role==='admin'){
+    db.all(`SELECT * FROM requests`, [], (err,rows)=> res.json(rows));
+  }else{
+    db.all(`SELECT * FROM requests WHERE owner_id=?`, [req.user.id], (err,rows)=> res.json(rows));
   }
 });
-</script>
-</body>
-</html>
+
+app.put('/api/requests/:id', auth, (req,res)=>{
+  const {title,description,price,delivery_time,status} = req.body;
+  db.get(`SELECT * FROM requests WHERE id=?`, [req.params.id], (err,row)=>{
+    if(!row) return res.status(404).json({message:'Request not found'});
+    if(req.user.role!=='admin' && row.owner_id!==req.user.id) return res.status(403).json({message:'Forbidden'});
+    const newStatus = status || row.status;
+    db.run(`UPDATE requests SET title=?,description=?,price=?,delivery_time=?,status=? WHERE id=?`,
+      [title||row.title, description||row.description, price||row.price, delivery_time||row.delivery_time, newStatus, req.params.id],
+      function(err){ if(err) return res.status(500).json({error:err.message}); res.json({success:true}); }
+    );
+  });
+});
+
+app.delete('/api/requests/:id', auth, (req,res)=>{
+  db.get(`SELECT * FROM requests WHERE id=?`, [req.params.id], (err,row)=>{
+    if(!row) return res.status(404).json({message:'Request not found'});
+    if(req.user.role!=='admin' && row.owner_id!==req.user.id) return res.status(403).json({message:'Forbidden'});
+    db.run(`DELETE FROM requests WHERE id=?`, [req.params.id], function(err){ if(err) return res.status(500).json({error:err.message}); res.json({success:true}); });
+  });
+});
+
+// ----- PAYMENTS -----
+app.post('/api/payments', auth, (req,res)=>{
+  const {request_id,amount,method} = req.body;
+  db.run(`INSERT INTO payments (request_id,amount,method) VALUES (?,?,?)`, [request_id,amount,method], function(err){ if(err) return res.status(500).json({error:err.message}); res.json({success:true}); });
+});
+
+app.put('/api/payments/:id/confirm', auth, permit('admin'), (req,res)=>{
+  db.run(`UPDATE payments SET status='confirmed' WHERE id=?`, [req.params.id], function(err){ if(err) return res.status(500).json({error:err.message}); res.json({success:true}); });
+});
+
+// ----- CHAT SOCKET -----
+io.on('connection', socket=>{
+  socket.on('join', room=>socket.join(room));
+  socket.on('send', ({room,sender,content})=>{
+    db.run(`INSERT INTO messages (request_id,sender,content) VALUES (?,?,?)`, [room,sender,content]);
+    io.to(room).emit('receive',{sender,content});
+  });
+});
+
+app.get('/api/messages/:requestId', auth, (req,res)=>{
+  db.all(`SELECT * FROM messages WHERE request_id=? ORDER BY id ASC`, [req.params.requestId], (err,rows)=> res.json(rows));
+});
+
+// ----- SERVER -----
+const PORT = 5000;
+server.listen(PORT, ()=>console.log(`Server running on port ${PORT}`));
+
